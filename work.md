@@ -30,6 +30,7 @@ wechat-bridge/
   bridge/cli.py     # login/wait-login/serve/send/status/poll-once/health
   docs/MECHANISM.md
   cron/muse-worker.md
+  systemd/wechat-bridge.service  # systemd unit 持久版（见 §3.5）
   state/ inbox/ outbox/ logs/  # .gitignore 全部排除
 ```
 
@@ -64,7 +65,26 @@ wechat-bridge/
 
 ### 3.3 serve
 
-- 单实例锁，避免多实例。VM 重启后需手动重起（删陈旧 lock → `nohup python3 -m bridge.cli serve`）。
+- 单实例锁，避免多实例。启动时**必须**做 PID 存活检查（不要只看 lock 文件存在，`health` 只看 lock 会误报）：
+  ```python
+  lock_path = STATE_DIR / "serve.lock"
+  if lock_path.exists():
+      try:
+          pid = int(lock_path.read_text().strip())
+          try:
+              os.kill(pid, 0)  # 只检查存活，不发信号
+              print(f"serve already running (pid={pid} alive), refusing second instance.")
+              return 3
+          except (ProcessLookupError, PermissionError):
+              print(f"stale lock (pid={pid} dead), removing.")
+              lock_path.unlink()
+      except (OSError, ValueError):
+          # 读不出 / 内容非法 → 当残留锁删掉
+          try: lock_path.unlink()
+          except OSError: pass
+  lock_path.write_text(str(os.getpid()))
+  ```
+  这样 VM 重启后的残留锁会被自动清理，不用手动删。禁止“不删 lock 就起第二个实例”（上面的 PID 检查已防止）。
 - 顺序：先发 `outbox` 中 `status=to_send` 的，再 `getupdates` 收新消息。
 - 游标 `get_updates_buf` 只有非空才更新。按 `message_id` 去重，写 `inbox/<id>.json`。
 - inbox 字段：`message_id, from_user_id, to_user_id, context_token, run_id, session_id, text, has_media, item_types, status=received`
@@ -79,6 +99,12 @@ wechat-bridge/
 - worker body 伪代码：
 
 ```
+0. SERVE RECOVERY（每轮开头，先于消息处理）：
+   - `systemctl is-active wechat-bridge.service` → 必须为 active。
+   - 若不是：`cp ~/workspace/wechat-bridge/systemd/wechat-bridge.service /etc/systemd/system/wechat-bridge.service && systemctl daemon-reload && systemctl reset-failed wechat-bridge.service && systemctl enable --now wechat-bridge.service`，然后验证 active 且只有一个 bridge.cli serve 进程。
+   - 仍起不来 → 按 §4 报错通知（Bark 优先）。
+   - 不要手动删 state/serve.lock（§3.3 已自动处理残留锁）。
+   - `bridge.cli health` 只看 lock 文件存在，会误报 ok，以 systemctl + 进程检查为准。
 1. 读 inbox/*.json，只处理 status=received。
    检查 stuck: status=processing 且 claimed_at >5min → 按 §4 报错处理，重置为 received 或 failed。
    若无 received 且无 stuck → 结束，不发任何消息。
@@ -95,6 +121,58 @@ wechat-bridge/
    f. 合并规则：仅当同发送者、<60s、第二条明显是续写才合并，否则一 message_id 一任务。
 3. 禁止读/打印 bot_token。禁止直接调 sendmessage（由 serve 发）。
 ```
+
+### 3.5 serve 开机自启（systemd，必须做）
+
+背景：Muse 的 VM 会因运行时发版被频繁替换（有时一小时一次），`nohup` 起的 serve 进程会被杀掉且不会自己回来。必须做成 systemd 服务，否则半夜 VM 一换微信桥就断。
+
+1. 写 unit 文件到 `~/workspace/wechat-bridge/systemd/wechat-bridge.service`（家目录持久化，VM 替换后还在）：
+```ini
+[Unit]
+Description=WeChat iLink bridge serve (Muse)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hatch/workspace/wechat-bridge
+ExecStart=/usr/bin/python3 -m bridge.cli serve
+Restart=always
+RestartSec=60
+StartLimitIntervalSec=900
+StartLimitBurst=6
+TimeoutStopSec=15
+KillMode=control-group
+StandardOutput=append:/home/hatch/workspace/wechat-bridge/logs/serve.log
+StandardError=inherit
+
+[Install]
+WantedBy=default.target
+```
+注意：
+- 路径按标准 Muse VM 布局写（home 为 /home/hatch）。如果你的环境 home 路径不同，把上面三处 `/home/hatch` 换成实际路径。
+- `WantedBy=default.target`：guest 只启动最小化的 default.target（不是 multi-user.target），必须挂在这个 target 下。
+- 用 system 级服务，不要用 `systemctl --user`：guest 里 user bus 不可用（`Failed to connect to bus: No medium found`）。
+
+2. 安装并启用（需要 root，Muse 的 exec 默认就是 root；先停掉之前 nohup 手动起的旧 serve，避免双实例）：
+```bash
+cp ~/workspace/wechat-bridge/systemd/wechat-bridge.service /etc/systemd/system/wechat-bridge.service
+systemctl daemon-reload
+systemctl enable --now wechat-bridge.service
+systemctl is-active wechat-bridge.service  # 必须输出 active
+```
+
+3. 验证自动拉起（kill 测试，必须做）：
+```bash
+kill -9 <serve-pid>
+sleep 75  # RestartSec=60，留余量
+systemctl is-active wechat-bridge.service  # 应为 active
+ps aux | grep "[b]ridge.cli serve"  # 必须恰好 1 个进程（新 PID），NRestarts 应为 1
+```
+
+4. VM 替换后的恢复（/etc 会被清空，unit 文件丢失）：
+- worker 定时任务（§3.4）每轮开头先做 SERVE RECOVERY：`systemctl is-active wechat-bridge.service` 不是 active → 重新执行第 2 步（cp unit → daemon-reload → `systemctl reset-failed` 清启动限制 → enable --now）→ 验证 active 且只有一个 serve 进程。
+- 因此 VM 替换后最长约一个 worker 轮询间隔（空闲时 10 分钟）serve 会自动回来。仍起不来 → 按 §4 报错通知。
 
 ## 4. 报错通知（必须实现）
 
@@ -147,9 +225,14 @@ wechat-bridge/
 - 禁止：直接删 `session.json` / `cursor.json` 来“修”卡住。
 
 ### P6: serve 挂了 / lock 陈旧 → 不收不发
-- 现象：`health` 显示 serve 不在跑，或 `serve` 启动报 lock 已存在。
-- 修复：查进程是否真的在跑。若 pid 已死，删陈旧 lock，`nohup python3 -m bridge.cli serve` 重起。VM 重启后必须手动重起 serve（无 systemd 监督）。
-- 禁止：不删 lock 就起第二个实例，会多实例抢发。
+- 现象：`health` 显示 serve 不在跑，或 `serve` 启动报 lock 已存在，或 `health` 报 ok 但实际没进程（误报）。
+- 根因：VM 重启（运行时发版会频繁替换 VM）杀掉进程；`health` 只看 lock 文件存在，会误报 ok；旧版 cli.py 只看 lock 存在就拒绝启动。
+- 修复（必须做 §3.5，不要再用 nohup 手工维持）：
+  1. cli.py 启动时做 PID 存活检查（§3.3），残留锁自动清理，不用手动删。
+  2. serve 做成 systemd 服务（Restart=always）+ 开机自启（§3.5），崩溃 60 秒内自动拉起。
+  3. worker 每轮开头做 SERVE RECOVERY（§3.4 step 0）：VM 替换清空 /etc 后重装 unit 并启动。
+- 判断 serve 是否真活着：以 `systemctl is-active wechat-bridge.service` + `ps` 看到恰好 1 个进程为准，不要信 `health` 的 lock 检查。
+- 禁止：不做 PID 检查就起第二个实例（§3.3 已防止）。
 
 ### P7: -14 暂停 → 以为凭据过期，盲目重扫
 - 现象：`ret/errcode == -14`，`serve` 停了。
@@ -198,7 +281,7 @@ wechat-bridge/
 ## 8. 出现不回复时的检查顺序
 
 1. `status`：session 是否 connected？inbox 是否有 received？outbox 是否有 failed？
-2. `health`：serve 是否在跑？session 是否 paused？
+2. `systemctl is-active wechat-bridge.service` + `ps` 确认恰好 1 个 serve 进程（以这个为准）；session 是否 paused？注意 `health` 只看 lock 文件存在，会误报 ok。
 3. `logs/bridge.log`（已脱敏）：区分网络 / API / -14。
 4. cron worker 最近是否 claim 了该消息？是否有 stuck processing？
 5. -14 → 等 1 小时或重扫，不要删 session/cursor。
@@ -215,4 +298,12 @@ python3 -m bridge.cli status
 python3 -m bridge.cli health
 # 登录成功后再装 worker（见 §3.4），自适应 10s/10m，每轮最多 3 条
 python3 -m bridge.cli send --to <to_user_id> --text "测试" --context-token <ctx>
+```
+
+# serve 开机自启（见 §3.5，必须做）
+```bash
+cp ~/workspace/wechat-bridge/systemd/wechat-bridge.service /etc/systemd/system/wechat-bridge.service
+systemctl daemon-reload
+systemctl enable --now wechat-bridge.service
+systemctl is-active wechat-bridge.service  # 必须输出 active
 ```
