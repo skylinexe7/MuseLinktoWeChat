@@ -4,6 +4,11 @@
 反馈/建议邮箱：skylinexe7@gmail.com
 QQ交流群号554020882
 
+## 安装使用
+新版本已发布 详见页面底部的Release
+
+
+
 ## 配置流程
 
 ### 1. 把 work.md 发给 Muse
