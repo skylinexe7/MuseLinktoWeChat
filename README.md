@@ -8,8 +8,8 @@
 
 ## 安装（约 10 分钟）
 
-1. 在本仓库的 Releases 里下载 `MLTW-skill.zip` 和 `Install prompts.md`
-2. 新开一个 Muse 对话，把 zip 作为附件上传，再把 `Install prompts.md` 里的整段文字发给它
+1. 在本仓库的 Releases 里下载 `MLTW-skill.zip` 和 `Install-prompts.md`
+2. 新开一个 Muse 对话，把 zip 作为附件上传，再把 `Install-prompts.md` 里的整段文字发给它
 3. 你的 Muse 会先审查代码、再安装部署；最后的微信扫码登录由你本人完成
 
 部署完成后，微信里发来的消息约 1–3 分钟内得到回复；桥的健康状态可用包内的自检脚本 `doctor.py` 一键检查。
